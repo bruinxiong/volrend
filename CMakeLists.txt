@@ -136,8 +136,14 @@ if (NOT EMSCRIPTEN)
     set( VOLREND_VENDOR_SOURCES
         ${VOLREND_VENDOR_SOURCES}
         ${GLEW_DIR}/src/glew.c
+        ${VENDOR_DIR}/misc/ImGuizmo.cpp
         )
 endif()
+
+set( VOLREND_VENDOR_SOURCES
+    ${VOLREND_VENDOR_SOURCES}
+    ${VENDOR_DIR}/misc/tiny_obj_loader.cpp
+)
 
 source_group( "Header Files" FILES ${VOLREND_HEADERS} )
 source_group( "Source Files" FILES ${VOLREND_SOURCES} )
@@ -145,7 +151,7 @@ source_group( "Source Files" FILES ${VOLREND_SOURCES} )
 set(
     DEPENDENCIES
     )
-if (NOT EMSCRIPTEN AND NOT WIN32)
+if (NOT EMSCRIPTEN AND NOT WIN32 AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     set(
         DEPENDENCIES
         ${DEPENDENCIES}
@@ -277,7 +283,7 @@ target_link_libraries( ${PROJ_LIB_NAME} PUBLIC
 
 if (EMSCRIPTEN)
     include_directories ( )
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3   --bind -s EXPORT_NAME=\"'Volrend'\" -s USE_WEBGL2=1 -s USE_GLFW=3 -s FULL_ES3=1 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s TOTAL_MEMORY=536870912 -s FETCH=1 -std=c++14")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3   --bind -s EXPORT_NAME=\"'Volrend'\" -s USE_WEBGL2=1 -s USE_GLFW=3 -s FULL_ES3=1 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s TOTAL_MEMORY=536870912 -s FORCE_FILESYSTEM=1 -s FETCH=1 -std=c++14")
     add_executable( volrend_web "web/main_web.cpp" )
     target_link_libraries( volrend_web
         ${PROJ_LIB_NAME} ${DEPENDENCIES} )
@@ -291,7 +297,6 @@ if (EMSCRIPTEN)
     # Write a list of js files in order they should be loaded here
     # index.html should only include main.js
     set(JS_SOURCES
-        vendor/jquery-3.5.1.min.js
         util.js
         glfwPatch.js
         guiComponents.js
@@ -340,10 +345,15 @@ if (EMSCRIPTEN)
         ${PROJECT_BINARY_DIR}/build/
         DEPENDS ${PROJECT_SOURCE_DIR}/web/index.html
         )
-    add_custom_target(html_config ALL DEPENDS "${PROJECT_BINARY_DIR}/build/index.html")
+    add_custom_target(html_config ALL DEPENDS "${PROJECT_BINARY_DIR}/build/index.html" js_config css_config)
 
     add_custom_target(serve
-        COMMAND python -m http.server --directory "${PROJECT_BINARY_DIR}/build/")
+        COMMAND ${Python_EXECUTABLE} -m http.server --directory "${PROJECT_BINARY_DIR}/build/"
+        DEPENDS html_config)
+
+    add_custom_command(
+        TARGET html_config POST_BUILD
+        COMMAND ${Python_EXECUTABLE} ${PROJECT_SOURCE_DIR}/web/autoversion.py "${PROJECT_BINARY_DIR}/build/")
 
 else (EMSCRIPTEN)
     if (VOLREND_BUILD_INSTALL)
@@ -404,10 +414,10 @@ else (EMSCRIPTEN)
     endmacro()
 
     VOLREND_ADD_EXECUTABLE(volrend_exe volrend main.cpp)
+    VOLREND_ADD_EXECUTABLE(volrend_anim_exe volrend_anim main_anim.cpp)
 
     if (_VOLREND_USE_CUDA)
         VOLREND_ADD_EXECUTABLE(volrend_headless_exe volrend_headless main_headless.cpp)
-        VOLREND_ADD_EXECUTABLE(volrend_anim_exe volrend_anim main_anim.cpp)
         if(WIN32)
             set_target_properties( ${PROJ_LIB_NAME}
                 PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)

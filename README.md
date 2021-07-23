@@ -10,13 +10,17 @@ https://alexyu.net/plenoctrees
 
 ![Screenshot](https://raw.githubusercontent.com/sxyu/volrend/master/img/screenshot_slice.jpg)
 
-The project currently has several repositories spanning Jax, PyTorch, and C++ code.
+The project has several repositories:
+
+- NeRF-SH training and PlenOctree extraction <https://github.com/sxyu/plenoctree>
+- PyTorch PlenOctree rendering CUDA extension <https://github.com/sxyu/svox>
+
 More will be released soon, we are taking a short break now.
 
 ## Building
 Please install a recent version of CMake <https://cmake.org>
 
-### Unix-like Systems
+### Linux
 ```sh
 mkdir build && cd build
 cmake ..
@@ -32,6 +36,16 @@ There is also an animation maker `volrend_anim`, which I used to make some of th
 You should be able to build the project as long as you have GLFW.
 On Ubuntu, you will need X-server; you can try
 `sudo apt-get install libgl1-mesa-dev libxi-dev libxinerama-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libglu1-mesa-dev`
+
+### macOS
+For macOS, we assume you have the homebrew package manager, and no CUDA-capable GPU.
+```sh
+brew install cmake
+brew install glfw
+mkdir build && cd build
+cmake .. -DVOLREND_USE_CUDA=OFF
+export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/lib; export CPLUS_INCLUDE_PATH="/usr/local/Cellar/glfw/3.3.4/include"; make -j8
+```
 
 ### Windows 10
 Install Visual Studio (I am using 2019 here). Then
@@ -63,19 +77,22 @@ There is also an animation maker `volrend_anim`, which I used to make some of th
 See `--help` for flags.
 
 There is an ImGui window which exposes rendering options as well as interactive features mentioned in the paper + video.
-For the mesh insertion, only very simple OBJ files (with triangles only) optionally with vertex coloring are supported. 
+For the mesh insertion, only OBJ files optionally with vertex coloring are supported. Texturing mapping is not implemented right now.
 Some example meshes are in `sample_obj`, and a program to generate SH meshes (just for fun) is in `sample_obj/sh/gen_sh.cpp`.
 Please use meshlab to triangulate other mesh.
 
-### Keyboard + Mouse Controls
+### Keyboard + Mouse Controls (Desktop GUI)
 - Left mouse btn + drag: rotate about camera position
 - Right mouse btn + drag: rotate about origin point (can be moved)
-- Shift + Left mouse btn + drag: pan camera
-- Middle mouse btn + drag: pan camera AND move origin point simultaneously
+- Middle mouse btn + drag: pan camera
+- Shift + Left mouse btn + drag: pan camera (alt)
+- Shift + middle mouse btn + drag: pan camera AND move origin point simultaneously
 - Scroll with wheel: move forward/back in z
 - WASDQE: move; Shift + WASDQE to move faster
 - 123456: preset `world_up` directions, sweep through these keys if scene is using different coordinate system.
 - 0: reset the focal length to default, if you messed with it
+- Z: cycle gizmo operations translate/rotate/scale (only visible if mesh is opened in Manipulate section)
+- X: toggle gizmo space local/world (applies to mesh translation/rotation)
 
 Lumisphere probe:
 - IJKLUO: move the lumisphere probe; Hold shift to move faster
@@ -113,11 +130,13 @@ The compression script used to turn this in to the web version is in `scripts/co
 
 More to come soon.
 
-## PyTorch Extension: svox 
+## PyTorch Extension: svox
 
 You can find a (mostly) compatible PlenOctree library called `svox`, which we use to build the tree;
-`pip install svox`. Documentation:
-https://www.ocf.berkeley.edu/~sxyu/docs/svox/build/html/svox.html
+`pip install svox`.
+
+- Code: <https://github.com/sxyu/svox>
+- Documentation: <https://svox.readthedocs.io>
 
 More information to be added soon.
 
@@ -140,5 +159,6 @@ To launch it locally for previewing, you can use the make target:
 ```sh
 make serve
 ```
-Which should launch a server at http://0.0.0.0:8000/
-
+Which should launch a server at http://0.0.0.0:8000/.
+NEW: You may load local files and OBJs by using `Load Local` in the navbar.
+Open `Layers` in the top right and click the camera layer to show cameras.

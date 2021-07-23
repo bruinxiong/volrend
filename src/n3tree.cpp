@@ -1,18 +1,19 @@
 #include "volrend/n3tree.hpp"
 #include "volrend/data_format.hpp"
+#include "volrend/internal/morton.hpp"
 
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <fstream>
 #include <thread>
 #include <atomic>
 
 #include "glm/geometric.hpp"
 
-#ifndef VOLREND_CUDA
 #include "half.hpp"
-#endif
 
 namespace volrend {
 namespace {
@@ -119,13 +120,18 @@ void N3Tree::open(const std::string& path) {
 
     poses_bounds_path_ = path.substr(0, path.size() - 4) + "_poses_bounds.npy";
 
+    if (!std::ifstream(path)) {
+        printf("Can't load because file does not exist: %s\n", path.c_str());
+        return;
+    }
+
     cnpy::npz_t npz = cnpy::npz_load(path);
     load_npz(npz);
 
     use_ndc = bool(std::ifstream(poses_bounds_path_));
     if (use_ndc) {
-        std::cerr << "INFO: Found poses_bounds.npy for NDC: "
-                  << poses_bounds_path_ << "\n";
+        fprintf(stderr, "INFO: Found poses_bounds.npy for NDC: %s\n",
+                poses_bounds_path_.c_str());
         cnpy::NpyArray poses_bounds = cnpy::npy_load(poses_bounds_path_);
 
         if (poses_bounds.word_size == 4) {
@@ -165,6 +171,60 @@ void N3Tree::open_mem(const char* data, uint64_t size) {
     data_loaded_ = true;
 }
 
+// namespace {
+// int _calc_tree_maxdepth(const N3Tree& tree, size_t nodeid, size_t xi, size_t
+// yi,
+//                         size_t zi) {
+//     const int32_t* child =
+//         tree.child_.data<int32_t>() + nodeid * tree.N * tree.N * tree.N;
+//     int maxdep = 0, cnt = 0;
+//     // Use integer coords to avoid precision issues
+//     for (size_t i = xi * tree.N; i < (xi + 1) * tree.N; ++i) {
+//         for (size_t j = yi * tree.N; j < (yi + 1) * tree.N; ++j) {
+//             for (size_t k = zi * tree.N; k < (zi + 1) * tree.N; ++k) {
+//                 if (child[cnt] != 0) {
+//                     int subdep =
+//                         _calc_tree_maxdepth(tree, nodeid + child[cnt], i, j,
+//                         k);
+//                     maxdep = std::max(subdep + 1, maxdep);
+//                 }
+//                 ++cnt;
+//             }
+//         }
+//     }
+//     return maxdep;
+// }
+//
+// // Populate the occupancy + voxel size grid
+// void _calc_occu_lut(N3Tree& tree, size_t nodeid, uint32_t xi, uint32_t yi,
+//                     uint32_t zi, int depth) {
+//     const int32_t* child =
+//         tree.child_.data<int32_t>() + nodeid * tree.N * tree.N * tree.N;
+//     int cnt = 0;
+//     uint8_t depth_diff = tree.max_depth - depth;
+//     uint32_t scale = 1 << depth_diff;
+//     uint32_t scale3 = scale * scale * scale;
+//     // Use integer coords to avoid precision issues
+//     for (uint32_t i = xi * tree.N; i < (xi + 1) * tree.N; ++i) {
+//         for (uint32_t j = yi * tree.N; j < (yi + 1) * tree.N; ++j) {
+//             for (uint32_t k = zi * tree.N; k < (zi + 1) * tree.N; ++k) {
+//                 if (child[cnt] == 0) {
+//                     uint32_t start = internal::morton_code_3(
+//                         i * scale, j * scale, k * scale);
+//                     uint32_t end = start + scale3;
+//                     std::fill(tree.occu_lut_.begin() + start,
+//                               tree.occu_lut_.begin() + end, depth_diff);
+//                 } else {
+//                     _calc_occu_lut(tree, nodeid + child[cnt], i, j, k,
+//                                    depth + 1);
+//                 }
+//                 ++cnt;
+//             }
+//         }
+//     }
+// }
+// }  // namespace
+
 void N3Tree::load_npz(cnpy::npz_t& npz) {
     data_dim = (int)*npz["data_dim"].data<int64_t>();
     if (npz.count("data_format")) {
@@ -181,16 +241,18 @@ void N3Tree::load_npz(cnpy::npz_t& npz) {
         // Old style auto-infer SH dims
         if (data_dim == 4) {
             data_format.format = DataFormat::RGBA;
-            std::cerr << "INFO: Legacy file with no format specifier; "
-                         "spherical basis disabled\n";
+            fprintf(stderr,
+                    "INFO: Legacy file with no format specifier; "
+                    "spherical basis disabled\n");
         } else {
             data_format.format = DataFormat::SH;
             data_format.basis_dim = (data_dim - 1) / 3;
-            std::cerr << "INFO: Legacy file with no format specifier; "
-                         "autodetect spherical harmonics order\n";
+            fprintf(stderr,
+                    "INFO: Legacy file with no format specifier; "
+                    "autodetect spherical harmonics order\n");
         }
     }
-    std::cerr << "INFO: Data format " << data_format.to_string() << "\n";
+    fprintf(stderr, "INFO: Data format %s\n", data_format.to_string().c_str());
 
     if (npz.count("invradius3")) {
         const float* scale_data = npz["invradius3"].data<float>();
@@ -199,8 +261,7 @@ void N3Tree::load_npz(cnpy::npz_t& npz) {
         scale[0] = scale[1] = scale[2] =
             (float)*npz["invradius"].data<double>();
     }
-    std::cerr << "INFO: Scale " << scale[0] << " " << scale[1] << " "
-              << scale[2] << "\n";
+    printf("INFO: Scale %f %f %f", scale[0], scale[1], scale[2]);
     {
         const float* offset_data = npz["offset"].data<float>();
         for (int i = 0; i < 3; ++i) offset[i] = offset_data[i];
@@ -209,11 +270,14 @@ void N3Tree::load_npz(cnpy::npz_t& npz) {
     auto child_node = npz["child"];
     std::swap(child_, npz["child"]);
     N = child_node.shape[1];
+    if (N != 2) {
+        fprintf(stderr, "WARNING: N != 2 probably doesn't work.\n");
+    }
     N2_ = N * N;
     N3_ = N * N * N;
 
     if (npz.count("quant_colors")) {
-        std::cerr << "INFO: Decoding quantized colors\n";
+        fprintf(stderr, "INFO: Decoding quantized colors\n");
         auto& quant_colors_node = npz["quant_colors"];
         if (quant_colors_node.word_size != 2) {
             throw std::runtime_error(
@@ -288,6 +352,13 @@ void N3Tree::load_npz(cnpy::npz_t& npz) {
     } else {
         extra_.data_holder.clear();
     }
+
+    // max_depth = _calc_tree_maxdepth(*this, 0, 0, 0, 0);
+    // resolution = 1 << (max_depth + 1);
+    // resolution3_ = resolution * resolution * resolution;
+    //
+    // occu_lut_.resize(resolution3_);
+    // _calc_occu_lut(*this, 0, 0, 0, 0, 0);
 }
 
 namespace {
@@ -354,7 +425,7 @@ void _gen_wireframe_impl(const N3Tree& tree, size_t nodeid, size_t xi,
 std::vector<float> N3Tree::gen_wireframe(int max_depth) const {
     std::vector<float> verts;
     if (!data_loaded_) {
-        std::cerr << "ERROR: Please load data before gen_wireframe!\n";
+        fprintf(stderr, "ERROR: Please load data before gen_wireframe!\n");
         return verts;
     }
     _gen_wireframe_impl(*this, 0, 0, 0, 0,
@@ -368,8 +439,9 @@ bool N3Tree::is_cuda_loaded() { return cuda_loaded_; }
 #endif
 
 void N3Tree::clear_cpu_memory() {
-    child_.data_holder.clear();
-    child_.data_holder.shrink_to_fit();
+    // Keep child in order to generate grids
+    // child_.data_holder.clear();
+    // child_.data_holder.shrink_to_fit();
     data_.data_holder.clear();
     data_.data_holder.shrink_to_fit();
 }

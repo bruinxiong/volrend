@@ -12,7 +12,6 @@
 
 #include "volrend/cuda/common.cuh"
 #include "volrend/cuda/renderer_kernel.hpp"
-#include "volrend/cuda/lumisphere.cuh"
 #include "volrend/internal/imwrite.hpp"
 
 namespace volrend {
@@ -183,7 +182,6 @@ struct VolumeRenderer::Impl {
     void maybe_gen_wire(int depth) {
         if (last_wire_depth_ != depth) {
             wire_.vert = tree->gen_wireframe(depth);
-            wire_.auto_faces();
             wire_.update();
             last_wire_depth_ = depth;
         }
@@ -204,6 +202,7 @@ struct VolumeRenderer::Impl {
     std::array<cudaArray_t, 4> ca;
 
     Mesh probe_, wire_;
+    // The depth level of the octree wireframe; -1 = not yet generated
     int last_wire_depth_ = -1;
 
     std::vector<Mesh>& meshes;

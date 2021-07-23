@@ -1,4 +1,5 @@
 #include "volrend/internal/opts.hpp"
+#include <cstdio>
 
 namespace volrend {
 namespace internal {
@@ -7,6 +8,8 @@ void add_common_opts(cxxopts::Options& options) {
     // clang-format off
     options.add_options()
         ("file", "npz file storing octree data", cxxopts::value<std::string>())
+        ("draw", "npz drawlist file",
+         cxxopts::value<std::string>()->default_value(""))
         ("gpu", "CUDA device id (only if using cuda; defaults to first one)",
              cxxopts::value<int>()->default_value("-1"))
         ("w,width", "image width", cxxopts::value<int>()->default_value("800"))
@@ -32,7 +35,7 @@ cxxopts::ParseResult parse_options(cxxopts::Options& options, int argc,
     options.parse_positional({"file"});
     cxxopts::ParseResult args = options.parse(argc, argv);
     if (args.count("help")) {
-        std::cout << options.help() << std::endl;
+        printf("%s\n", options.help().c_str());
         std::exit(0);
     }
     return args;
@@ -50,7 +53,7 @@ RenderOptions render_options_from_args(cxxopts::ParseResult& args) {
         options.enable_probe = true;
         auto probe = args["probe"].as<std::vector<float>>();
         if (probe.size() < 3) {
-            std::cerr << "ERROR: --probe must be of format 'x,y,z'\n";
+            fprintf(stderr, "ERROR: --probe must be of format 'x,y,z'\n");
         } else {
             for (int i = 0; i < 3; ++i) options.probe[i] = probe[i];
         }

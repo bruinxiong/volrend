@@ -16,7 +16,6 @@
 #include <cuda_fp16.h>
 #else
 #include <half.hpp>
-using half_float::half;
 #endif
 
 namespace volrend {
@@ -37,7 +36,7 @@ struct N3Tree {
     // up to given depth (default none)
     std::vector<float> gen_wireframe(int max_depth = 100000) const;
 
-    // Spatial branching factor
+    // Spatial branching factor. Only 2 really supported.
     int N = 0;
     // Size of data stored on each leaf
     int data_dim;
@@ -84,10 +83,11 @@ struct N3Tree {
     // Child link data holder
     cnpy::NpyArray child_;
 
-    // Optional extra data
+    // Optional extra data, only used for SG/ASG
     cnpy::NpyArray extra_;
 
    private:
+    // Load data from npz (destructive since it moves some data)
     void load_npz(cnpy::npz_t& npz);
 
     // Paths

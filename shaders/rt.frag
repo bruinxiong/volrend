@@ -1,5 +1,3 @@
-#version 300 es
-
 precision highp float;
 precision highp int;
 
@@ -63,6 +61,10 @@ uniform int tree_data_dim;
 uniform mediump sampler2D tree_data_tex;
 // uniform highp sampler2D tree_extra_tex;
 
+// Mesh rendering compositing
+uniform mediump sampler2D mesh_depth_tex;
+uniform mediump sampler2D mesh_color_tex;
+
 // Hacky ways to store octree in 2 textures
 float get_tree_data(int y, int x) {
     return texelFetch(tree_data_tex, ivec2(x, y), 0).r;
@@ -123,33 +125,33 @@ void rodrigues(vec3 aa, inout vec3 dir) {
 // **** CORE RAY TRACER IMPLEMENTATION ****
 void maybe_precalc_basis(const vec3 dir, inout float outb[VOLREND_GLOBAL_BASIS_MAX]) {
     // switch(tree.format) {
-    //     case FORMAT_ASG:
-    //         {
-    //             for (int i = 0; i < tree.basis_dim; ++i) {
-    //                 float lambda_x = index_extra(i, 0);
-    //                 float lambda_y = index_extra(i, 1);
-    //                 vec3 mu_x = vec3(index_extra(i, 2), index_extra(i, 3), index_extra(i, 4));
-    //                 vec3 mu_y = vec3(index_extra(i, 5), index_extra(i, 6), index_extra(i, 7));
-    //                 vec3 mu_z = vec3(index_extra(i, 8), index_extra(i, 9), index_extra(i, 10));
-    //                 float S = dot(dir, mu_z);
-    //                 float dot_x = dot(dir, mu_x);
-    //                 float dot_y = dot(dir, mu_y);
-    //                 outb[i] = S * exp(-lambda_x * dot_x * dot_x
-    //                                   -lambda_y * dot_y * dot_y) / float(tree.basis_dim);
-    //             }
-    //         }
-    //         break;
-    //     case FORMAT_SG:
-    //         {
-    //             for (int i = 0; i < tree.basis_dim; ++i) {
-    //                 vec3 mu = vec3(index_extra(i, 1), index_extra(i, 2), index_extra(i, 3));
-    //                 outb[i] = exp(index_extra(i, 0) * (dot(dir, mu) - 1.f)) /
-    //                               float(tree.basis_dim);
-    //             }
-    //         }
-    //         break;
-    //     case FORMAT_SH:
-    //         {
+        // case FORMAT_ASG:
+        //     {
+        //         for (int i = 0; i < tree.basis_dim; ++i) {
+        //             float lambda_x = index_extra(i, 0);
+        //             float lambda_y = index_extra(i, 1);
+        //             vec3 mu_x = vec3(index_extra(i, 2), index_extra(i, 3), index_extra(i, 4));
+        //             vec3 mu_y = vec3(index_extra(i, 5), index_extra(i, 6), index_extra(i, 7));
+        //             vec3 mu_z = vec3(index_extra(i, 8), index_extra(i, 9), index_extra(i, 10));
+        //             float S = dot(dir, mu_z);
+        //             float dot_x = dot(dir, mu_x);
+        //             float dot_y = dot(dir, mu_y);
+        //             outb[i] = S * exp(-lambda_x * dot_x * dot_x
+        //                               -lambda_y * dot_y * dot_y) / float(tree.basis_dim);
+        //         }
+        //     }
+        //     break;
+        // case FORMAT_SG:
+        //     {
+        //         for (int i = 0; i < tree.basis_dim; ++i) {
+        //             vec3 mu = vec3(index_extra(i, 1), index_extra(i, 2), index_extra(i, 3));
+        //             outb[i] = exp(index_extra(i, 0) * (dot(dir, mu) - 1.f)) /
+        //                           float(tree.basis_dim);
+        //         }
+        //     }
+        //     break;
+        // case FORMAT_SH:
+            {
                 outb[0] = 0.28209479177387814;
                 float x = dir[0], y = dir[1], z = dir[2];
                 float xx = x * x, yy = y * y, zz = z * z;
@@ -184,7 +186,7 @@ void maybe_precalc_basis(const vec3 dir, inout float outb[VOLREND_GLOBAL_BASIS_M
                         outb[2] = 0.4886025119029199 * z;
                         outb[3] = -0.4886025119029199 * x;
                 }
-    //     }
+        }
     // }
 }
 
@@ -217,16 +219,17 @@ float _get_delta_scale(vec3 scaling, inout vec3 dir) {
     return delta_scale;
 }
 
-vec3 trace_ray(vec3 dir, vec3 vdir, vec3 cen) {
+vec3 trace_ray(vec3 dir, vec3 vdir, vec3 cen, float tmax_bg, vec3 bg_color) {
     float delta_scale = _get_delta_scale(tree.scale, dir);
     vec3 output_color;
     vec3 invdir = 1.f / (dir + 1e-9);
     float tmin, tmax;
     dda_world(cen, invdir, tmin, tmax);
+    tmax = min(tmax, tmax_bg / delta_scale);
 
-    if (tmax < 0.f || tmin > tmax) {
-        // Ray doesn't hit box
-        output_color = vec3(opt.background_brightness);
+    if (tmax < 0.f || tmin > tmax || tree_data_dim == 0) {
+        // Ray doesn't hit box or tree not loaded
+        output_color = bg_color;
     } else {
         output_color = vec3(.0f);
         float basis_fn[VOLREND_GLOBAL_BASIS_MAX];
@@ -262,43 +265,49 @@ vec3 trace_ray(vec3 dir, vec3 vdir, vec3 cen) {
                 float weight = light_intensity * (1.f - att);
 
                 int off = tree_x;
+                if (tree.format != FORMAT_RGBA) {
 #define MUL_BASIS_I(t) basis_fn[t] * get_tree_data(tree_y, off + t)
-                for (int t = 0; t < 3; ++ t) {
-                    float tmp = basis_fn[0] * get_tree_data(tree_y, off);
-                    switch(tree.basis_dim) {
-                        // case 25:
-                        //     tmp += MUL_BASIS_I(16) +
-                        //         MUL_BASIS_I(17) +
-                        //         MUL_BASIS_I(18) +
-                        //         MUL_BASIS_I(19) +
-                        //         MUL_BASIS_I(20) +
-                        //         MUL_BASIS_I(21) +
-                        //         MUL_BASIS_I(22) +
-                        //         MUL_BASIS_I(23) +
-                        //         MUL_BASIS_I(24);
-                        case 16:
-                            tmp += MUL_BASIS_I(9) +
-                                MUL_BASIS_I(10) +
-                                MUL_BASIS_I(11) +
-                                MUL_BASIS_I(12) +
-                                MUL_BASIS_I(13) +
-                                MUL_BASIS_I(14) +
-                                MUL_BASIS_I(15);
+                    for (int t = 0; t < 3; ++ t) {
+                        float tmp = basis_fn[0] * get_tree_data(tree_y, off);
+                        switch(tree.basis_dim) {
+                            // case 25:
+                            //     tmp += MUL_BASIS_I(16) +
+                            //         MUL_BASIS_I(17) +
+                            //         MUL_BASIS_I(18) +
+                            //         MUL_BASIS_I(19) +
+                            //         MUL_BASIS_I(20) +
+                            //         MUL_BASIS_I(21) +
+                            //         MUL_BASIS_I(22) +
+                            //         MUL_BASIS_I(23) +
+                            //         MUL_BASIS_I(24);
+                            case 16:
+                                tmp += MUL_BASIS_I(9) +
+                                    MUL_BASIS_I(10) +
+                                    MUL_BASIS_I(11) +
+                                    MUL_BASIS_I(12) +
+                                    MUL_BASIS_I(13) +
+                                    MUL_BASIS_I(14) +
+                                    MUL_BASIS_I(15);
 
-                        case 9:
-                            tmp += MUL_BASIS_I(4) +
-                                MUL_BASIS_I(5) +
-                                MUL_BASIS_I(6) +
-                                MUL_BASIS_I(7) +
-                                MUL_BASIS_I(8);
+                            case 9:
+                                tmp += MUL_BASIS_I(4) +
+                                    MUL_BASIS_I(5) +
+                                    MUL_BASIS_I(6) +
+                                    MUL_BASIS_I(7) +
+                                    MUL_BASIS_I(8);
 
-                        case 4:
-                            tmp += MUL_BASIS_I(1) +
-                                MUL_BASIS_I(2) +
-                                MUL_BASIS_I(3);
+                            case 4:
+                                tmp += MUL_BASIS_I(1) +
+                                    MUL_BASIS_I(2) +
+                                    MUL_BASIS_I(3);
+                        }
+                        output_color[t] += weight / (1.0 + exp(-tmp));
+                        off += tree.basis_dim;
                     }
-                    output_color[t] += weight / (1.0 + exp(-tmp));
-                    off += tree.basis_dim;
+                } else {
+                    for (int t = 0; t < 3; ++ t) {
+                        output_color[t] += weight * get_tree_data(tree_y, tree_x + t);
+                    }
                 }
 
                 light_intensity *= att;
@@ -311,7 +320,7 @@ vec3 trace_ray(vec3 dir, vec3 vdir, vec3 cen) {
             }
             t += delta_t;
         }
-        output_color += light_intensity * opt.background_brightness;
+        output_color += light_intensity * bg_color;
         return output_color;
     }
     return output_color;
@@ -347,7 +356,14 @@ void main()
     }
     cen = tree.center + cen * tree.scale;
     rodrigues(opt.rot_dirs, vdir);
-    rgb = trace_ray(dir, vdir, cen);
+
+    // Get depth of drawn meshes
+    ivec2 screen_pt = ivec2(gl_FragCoord.x, gl_FragCoord.y);
+    float tmax_bg = texelFetch(mesh_depth_tex, screen_pt, 0).r;
+    vec4 mesh_color = texelFetch(mesh_color_tex, screen_pt, 0);
+    vec3 bg_color = vec3(mesh_color);
+
+    rgb = trace_ray(dir, vdir, cen, tmax_bg, bg_color);
     rgb = clamp(rgb, 0.0, 1.0);
     FragColor = vec4(rgb, 1.0);
 }

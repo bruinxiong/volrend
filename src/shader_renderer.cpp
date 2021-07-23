@@ -3,9 +3,11 @@
 // Shader backend only enabled when build with VOLREND_USE_CUDA=OFF
 #ifndef VOLREND_CUDA
 #include "volrend/renderer.hpp"
+#include "volrend/mesh.hpp"
 #include <glm/gtc/type_ptr.hpp>
 
 #include <fstream>
+#include <cstdio>
 #include <cstdint>
 #include <string>
 
@@ -24,8 +26,8 @@ namespace volrend {
 namespace {
 
 const char* PASSTHRU_VERT_SHADER_SRC =
-    R"glsl(#version 300 es
-layout (location = 0) in vec3 aPos;
+    R"glsl(
+in vec3 aPos;
 
 void main()
 {
@@ -41,35 +43,93 @@ struct _RenderUniforms {
     GLint cam_transform, cam_focal, cam_reso;
     GLint opt_step_size, opt_backgrond_brightness, opt_stop_thresh,
         opt_sigma_thresh, opt_render_bbox, opt_basis_minmax, opt_rot_dirs;
-    GLint tree_data_tex, tree_child_tex, tree_extra_tex;
+    GLint tree_data_tex, tree_child_tex;  //, tree_extra_tex;
+    GLint mesh_depth_tex, mesh_color_tex;
 };
 
 }  // namespace
 
 struct VolumeRenderer::Impl {
-    Impl(Camera& camera, RenderOptions& options, int max_tries = 4)
-        : camera(camera), options(options) {}
+    Impl(Camera& camera, RenderOptions& options, std::vector<Mesh>& meshes,
+         int max_tries = 4)
+        : camera(camera), options(options), meshes(meshes) {
+        probe_ = Mesh::Cube(glm::vec3(0.0));
+        probe_.name = "_probe_cube";
+        probe_.visible = false;
+        probe_.scale = 0.05f;
+        // Make face colors
+        for (int i = 0; i < 3; ++i) {
+            int off = i * 12 * 9;
+            for (int j = 0; j < 12; ++j) {
+                int soff = off + 9 * j + 3;
+                probe_.vert[soff + 2 - i] = 1.f;
+            }
+        }
+        probe_.unlit = true;
+        probe_.update();
+        wire_.face_size = 2;
+        wire_.unlit = true;
+    }
 
     ~Impl() {
         glDeleteProgram(program);
+        glDeleteFramebuffers(1, &fb);
         glDeleteTextures(1, &tex_tree_data);
         glDeleteTextures(1, &tex_tree_child);
         glDeleteTextures(1, &tex_tree_extra);
+        glDeleteTextures(1, &tex_mesh_color);
+        glDeleteTextures(1, &tex_mesh_depth);
+        glDeleteTextures(1, &tex_mesh_depth_buf);
     }
 
     void start() {
         if (started_) return;
-        resize(0, 0);
-
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &tex_max_size);
         // int tex_3d_max_size;
         // glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &tex_3d_max_size);
-        // std::cout << " texture dim limit: " << tex_max_size << "\n";
-        // std::cout << " texture 3D dim limit: " << tex_3d_max_size << "\n";
 
         glGenTextures(1, &tex_tree_data);
         glGenTextures(1, &tex_tree_child);
         glGenTextures(1, &tex_tree_extra);
+
+        glGenTextures(1, &tex_mesh_color);
+        glGenTextures(1, &tex_mesh_depth);
+        glGenTextures(1, &tex_mesh_depth_buf);
+        glGenFramebuffers(1, &fb);
+
+        // Put some dummy information to suppress browser warnings
+        glBindTexture(GL_TEXTURE_2D, tex_tree_data);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, 1, 1, 0, GL_RED, GL_HALF_FLOAT,
+                     nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, tex_tree_child);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, 1, 1, 0, GL_RED_INTEGER, GL_INT,
+                     nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        resize(800, 800);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fb);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tex_mesh_color, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                               GL_TEXTURE_2D, tex_mesh_depth, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                               GL_TEXTURE_2D, tex_mesh_depth_buf, 0);
+        const GLenum attach_buffers[]{GL_COLOR_ATTACHMENT0,
+                                      GL_COLOR_ATTACHMENT1};
+        glDrawBuffers(2, attach_buffers);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE) {
+            fprintf(stderr, "Framebuffer not complete\n");
+            std::exit(1);
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         quad_init();
         shader_init();
@@ -77,10 +137,44 @@ struct VolumeRenderer::Impl {
     }
 
     void render() {
-        glClear(GL_COLOR_BUFFER_BIT);
-        if (tree == nullptr || !started_) return;
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        if (!started_) return;
 
         camera._update();
+        if (options.show_grid) {
+            maybe_gen_wire(options.grid_max_depth);
+        }
+
+        GLfloat clear_color[] = {options.background_brightness,
+                                 options.background_brightness,
+                                 options.background_brightness, 1.f};
+        GLfloat depth_inf = 1e9, zero = 0;
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fb);
+        glDepthMask(GL_TRUE);
+
+#ifdef __EMSCRIPTEN__
+        // GLES 3
+        glClearDepthf(1.f);
+#else
+        glClearDepth(1.f);
+#endif
+        glClearBufferfv(GL_COLOR, 0, clear_color);
+        glClearBufferfv(GL_COLOR, 1, &depth_inf);
+        glClearBufferfv(GL_DEPTH, 0, &depth_inf);
+
+        Mesh::use_shader();
+        for (const Mesh& mesh : meshes) {
+            mesh.draw(camera.w2c, camera.K, false);
+        }
+        probe_.draw(camera.w2c, camera.K);
+        if (options.show_grid) {
+            wire_.draw(camera.w2c, camera.K, false);
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glUseProgram(program);
+
         // FIXME reduce uniform transfers?
         glUniformMatrix4x3fv(u.cam_transform, 1, GL_FALSE,
                              glm::value_ptr(camera.transform));
@@ -94,19 +188,24 @@ struct VolumeRenderer::Impl {
         glUniform1iv(u.opt_basis_minmax, 2, options.basis_minmax);
         glUniform3fv(u.opt_rot_dirs, 1, options.rot_dirs);
 
-        // FIXME Probably can be done ony once
+        // FIXME Probably can be done only once
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex_tree_child);
 
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, tex_tree_data);
 
-        // glActiveTexture(GL_TEXTURE2);
-        // glBindTexture(GL_TEXTURE_2D, tex_tree_extra);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, tex_mesh_depth);
 
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, tex_mesh_color);
+
+        // glActiveTexture(GL_TEXTURE4);
+        // glBindTexture(GL_TEXTURE_2D, tex_tree_extra);
         glBindVertexArray(vao_quad);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, (GLsizei)4);
-        // glBindVertexArray(0);
+        glBindVertexArray(0);
     }
 
     void set(N3Tree& tree) {
@@ -117,16 +216,46 @@ struct VolumeRenderer::Impl {
             upload_child_links();
             upload_tree_spec();
         }
+        options.basis_minmax[0] = 0;
+        options.basis_minmax[1] = std::max(tree.data_format.basis_dim - 1, 0);
+    }
+
+    void maybe_gen_wire(int depth) {
+        if (last_wire_depth_ != depth) {
+            wire_.vert = tree->gen_wireframe(depth);
+            wire_.update();
+            last_wire_depth_ = depth;
+        }
     }
 
     void clear() { this->tree = nullptr; }
 
     void resize(const int width, const int height) {
         if (camera.width == width && camera.height == height) return;
-        if (width > 0) {
-            camera.width = width;
-            camera.height = height;
-        }
+        if (width <= 0 || height <= 0) return;
+        camera.width = width;
+        camera.height = height;
+
+        // Re-allocate memory for textures used in mesh-volume compositing
+        // process
+        glBindTexture(GL_TEXTURE_2D, tex_mesh_color);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
+        glBindTexture(GL_TEXTURE_2D, tex_mesh_depth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, width, height, 0, GL_RED,
+                     GL_FLOAT, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
+        glBindTexture(GL_TEXTURE_2D, tex_mesh_depth_buf);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width, height, 0,
+                     GL_DEPTH_COMPONENT, GL_FLOAT, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
         glViewport(0, 0, width, height);
     }
 
@@ -144,7 +273,8 @@ struct VolumeRenderer::Impl {
         height = (size - 1) / width + 1;
         if (height > tex_max_size || width > tex_max_size) {
             throw std::runtime_error(
-                "Octree data exceeds hardward 2D texture limit\n");
+                "Octree data exceeds your OpenGL driver's 2D texture limit.\n"
+                "Please try the CUDA renderer or another device.");
         }
     }
 
@@ -153,15 +283,27 @@ struct VolumeRenderer::Impl {
             tree->capacity * tree->N * tree->N * tree->N * tree->data_dim;
         size_t width, height;
         auto_size_2d(data_size, width, height, tree->data_dim);
-        // FIXME can we remove the copy to float here?
-        // Can't seem to get half glTexImage2D to work
         const size_t pad = width * height - data_size;
-        tree->data_.data_holder.resize((data_size + pad) * sizeof(half));
+
+        glUseProgram(program);
         glUniform1i(glGetUniformLocation(program, "tree_data_dim"), width);
 
+#ifdef __EMSCRIPTEN__
+        tree->data_.data_holder.resize((data_size + pad) * sizeof(half));
         glBindTexture(GL_TEXTURE_2D, tex_tree_data);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, width, height, 0, GL_RED,
                      GL_HALF_FLOAT, tree->data_.data<half>());
+#else
+        // FIXME: there seems to be some weird bug in the NVIDIA OpenGL
+        // implementation where GL_HALF_FLOAT is sometimes ignored, and we have
+        // to use float32 for uploads
+        std::vector<float> tmp(data_size + pad);
+        std::copy(tree->data_.data<half>(),
+                  tree->data_.data<half>() + data_size, tmp.begin());
+        glBindTexture(GL_TEXTURE_2D, tex_tree_data);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, width, height, 0, GL_RED,
+                     GL_FLOAT, (void*)tmp.data());
+#endif
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
@@ -206,7 +348,9 @@ struct VolumeRenderer::Impl {
         glUniform1i(glGetUniformLocation(program, "tree.format"),
                     (int)tree->data_format.format);
         glUniform1i(glGetUniformLocation(program, "tree.basis_dim"),
-                    tree->data_format.basis_dim);
+                    tree->data_format.format == DataFormat::RGBA
+                        ? 1
+                        : tree->data_format.basis_dim);
         glUniform3f(glGetUniformLocation(program, "tree.center"),
                     tree->offset[0], tree->offset[1], tree->offset[2]);
         glUniform3f(glGetUniformLocation(program, "tree.scale"), tree->scale[0],
@@ -239,10 +383,15 @@ struct VolumeRenderer::Impl {
         u.opt_rot_dirs = glGetUniformLocation(program, "opt.rot_dirs");
         u.tree_data_tex = glGetUniformLocation(program, "tree_data_tex");
         u.tree_child_tex = glGetUniformLocation(program, "tree_child_tex");
-        u.tree_extra_tex = glGetUniformLocation(program, "tree_extra_tex");
+        u.mesh_depth_tex = glGetUniformLocation(program, "mesh_depth_tex");
+        u.mesh_color_tex = glGetUniformLocation(program, "mesh_color_tex");
+        // u.tree_extra_tex = glGetUniformLocation(program, "tree_extra_tex");
         glUniform1i(u.tree_child_tex, 0);
         glUniform1i(u.tree_data_tex, 1);
-        glUniform1i(u.tree_extra_tex, 2);
+        glUniform1i(u.mesh_depth_tex, 2);
+        glUniform1i(u.mesh_color_tex, 3);
+        glUniform1i(glGetUniformLocation(program, "tree_data_dim"), 0);
+        // glUniform1i(u.tree_extra_tex, 4);
     }
 
     void quad_init() {
@@ -269,6 +418,14 @@ struct VolumeRenderer::Impl {
     GLuint vao_quad;
     GLint tex_max_size;
 
+    Mesh probe_, wire_;
+    // The depth level of the octree wireframe; -1 = not yet generated
+    int last_wire_depth_ = -1;
+
+    std::vector<Mesh>& meshes;
+
+    GLuint fb, tex_mesh_color, tex_mesh_depth, tex_mesh_depth_buf;
+
     std::string shader_fname = "shaders/rt.frag";
 
     _RenderUniforms u;
@@ -276,7 +433,7 @@ struct VolumeRenderer::Impl {
 };
 
 VolumeRenderer::VolumeRenderer()
-    : impl_(std::make_unique<Impl>(camera, options)) {}
+    : impl_(std::make_unique<Impl>(camera, options, meshes)) {}
 
 VolumeRenderer::~VolumeRenderer() {}
 
